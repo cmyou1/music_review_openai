@@ -1,9 +1,11 @@
 'use client';
 
 import { useEffect, useState, use } from 'react';
-import Link from 'next/link'; // ✅ 링크 기능 추가
+import Link from 'next/link';
 import { api } from '@/lib/api';
-import { MessageSquare, RefreshCw, CheckCircle, ArrowLeft } from 'lucide-react'; // ✅ 화살표 아이콘 추가
+import { MessageSquare, RefreshCw, CheckCircle, ArrowLeft } from 'lucide-react';
+// ✅ [추가됨] 방금 만든 리뷰 텍스트 변환기 불러오기
+import ReviewText from '@/components/ReviewText';
 
 export default function SongDetail({ params }: { params: Promise<{ id: string }> }) {
   const resolvedParams = use(params);
@@ -14,7 +16,7 @@ export default function SongDetail({ params }: { params: Promise<{ id: string }>
   const [newComment, setNewComment] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(true);
 
-  // 데이터 로딩 로직 (기존과 동일)
+  // 데이터 로딩
   useEffect(() => {
     if (isNaN(id)) return;
     let interval: NodeJS.Timeout;
@@ -40,7 +42,7 @@ export default function SongDetail({ params }: { params: Promise<{ id: string }>
     return () => clearInterval(interval);
   }, [id]);
 
-  // 댓글 등록 로직 (기존과 동일)
+  // 댓글 등록
   const handlePostComment = async () => {
     if (!newComment.trim()) return;
     await api.addComment(id, "User", newComment);
@@ -49,19 +51,34 @@ export default function SongDetail({ params }: { params: Promise<{ id: string }>
     setComments(updated);
   };
 
-  // 재분석 요청 로직 (기존과 동일 + 예외처리)
+  // 재분석 요청
   const handleRefine = async () => {
     if (comments.length === 0) {
       alert("AI에게 전달할 피드백(댓글)이 없습니다!");
       return;
     }
-    setIsAnalyzing(true);
-    await api.refineAnalysis(id); // API 호출 (api.ts에 추가 필요)
     
-    // 즉시 재로딩 시작
-    const updatedSong = await api.getSong(id);
-    setSong(updatedSong);
-    setIsAnalyzing(false);
+    setIsAnalyzing(true);
+    
+    try {
+      const result = await api.refineAnalysis(id);
+      
+      if (result.status === "error") {
+        alert(`❌ 재분석 실패: ${result.message}`);
+        setIsAnalyzing(false);
+        return;
+      }
+      
+      const updatedSong = await api.getSong(id);
+      setSong(updatedSong);
+      alert("✅ 피드백이 반영되어 분석 리포트가 업데이트되었습니다!");
+      
+    } catch (e) {
+      console.error(e);
+      alert("서버 통신 중 오류가 발생했습니다.");
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
   if (!song) return <div className="min-h-screen bg-black text-white p-12 flex justify-center">Loading...</div>;
@@ -70,7 +87,7 @@ export default function SongDetail({ params }: { params: Promise<{ id: string }>
     <div className="min-h-screen bg-black text-white p-6 md:p-12">
       <div className="max-w-4xl mx-auto space-y-6">
         
-        {/* ✅ [추가됨] 상단 네비게이션 (홈으로 가기) */}
+        {/* 상단 네비게이션 */}
         <Link href="/" className="inline-flex items-center text-gray-400 hover:text-white transition mb-4">
           <ArrowLeft className="w-5 h-5 mr-2" />
           다른 곡 분석하러 가기
@@ -97,26 +114,27 @@ export default function SongDetail({ params }: { params: Promise<{ id: string }>
         {/* 컨텐츠 그리드 */}
         <div className="grid md:grid-cols-3 gap-8">
           
-          {/* 왼쪽: AI 분석 리포트 */}
-          <div className="md:col-span-2 bg-gray-900/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-800">
+          {/* 왼쪽: AI 분석 리포트 (ReviewText 적용됨!) */}
+          <div className="md:col-span-2 bg-gray-900/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-800 shadow-lg">
             <h2 className="text-xl font-bold text-purple-400 mb-6 border-b border-gray-800 pb-2">🎧 사운드 분석 리포트</h2>
-            <div className="prose prose-invert max-w-none whitespace-pre-line text-gray-300 leading-relaxed text-sm md:text-base">
-              {song.initial_analysis === "Analyzing..." 
-                ? "잠시만 기다려주세요. AI가 오디오를 듣고 있습니다..." 
-                : song.initial_analysis}
-            </div>
+            
+            {/* 👇 여기 ReviewText 컴포넌트가 마법을 부립니다 */}
+            {song.initial_analysis === "Analyzing..." 
+              ? <div className="flex items-center justify-center h-40 text-gray-400 animate-pulse">
+                  AI가 오디오 파형을 정밀 분석 중입니다...
+                </div>
+              : <ReviewText content={song.initial_analysis} />
+            }
           </div>
 
           {/* 오른쪽: 댓글창 & 재분석 */}
           <div className="space-y-4">
-            <div className="bg-gray-900/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-800 h-[500px] flex flex-col">
+            <div className="bg-gray-900/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-800 h-[500px] flex flex-col shadow-lg">
               
-              {/* 헤더 + 재분석 버튼 */}
               <div className="flex justify-between items-center mb-4">
                 <h2 className="text-xl font-bold flex items-center text-white">
                   <MessageSquare className="w-5 h-5 mr-2 text-blue-400" /> 피드백
                 </h2>
-                {/* ✅ 재분석 버튼 */}
                 <button 
                   onClick={handleRefine}
                   disabled={isAnalyzing}
@@ -146,14 +164,14 @@ export default function SongDetail({ params }: { params: Promise<{ id: string }>
                 <textarea
                   value={newComment}
                   onChange={(e) => setNewComment(e.target.value)}
-                  className="w-full bg-black/50 border border-gray-700 rounded-xl p-3 text-sm text-white mb-3 outline-none focus:border-purple-500 transition"
+                  className="w-full bg-black/50 border border-gray-700 rounded-xl p-3 text-sm text-white mb-3 outline-none focus:border-purple-500 transition resize-none"
                   placeholder="의견을 입력하세요..."
                   rows={3}
                 />
                 <button
                   onClick={handlePostComment}
                   disabled={!newComment.trim()}
-                  className="w-full bg-gradient-to-r from-purple-600 to-blue-600 text-white py-2.5 rounded-xl text-sm font-bold hover:opacity-90 transition"
+                  className="w-full bg-gradient-to-r from-purple-600 to-blue-600 text-white py-2.5 rounded-xl text-sm font-bold hover:opacity-90 transition disabled:opacity-50"
                 >
                   등록
                 </button>

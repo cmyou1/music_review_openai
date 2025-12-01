@@ -1,74 +1,206 @@
 from fastapi import FastAPI, UploadFile, File, Form, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-import hashlib, shutil, os
+import hashlib
+import shutil
+import os
+import uuid
+import time
+
 from database import SessionLocal, init_db, Song, Comment
 import openai_service
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 init_db()
 
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
-
-def calculate_file_hash(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(4096), b""): h.update(b)
-    return h.hexdigest()
-
-async def process_ai(song_id: int, path: str, title: str):
-    db = SessionLocal()
     try:
-        result = openai_service.analyze_audio_with_openai(path, title)
-        song = db.query(Song).filter(Song.id == song_id).first()
-        if song:
-            song.initial_analysis = result
-            db.commit()
+        yield db
     finally:
         db.close()
-        if os.path.exists(path): os.remove(path)
+
+# 안전 삭제 함수
+def safe_delete(file_path: str):
+    if not os.path.exists(file_path):
+        return
+    for i in range(3):
+        try:
+            os.remove(file_path)
+            print(f"🗑️ 파일 삭제 완료: {file_path}")
+            return
+        except Exception as e:
+            print(f"⚠️ 삭제 재시도 ({i+1}/3): {e}")
+            time.sleep(0.5)
+
+def calculate_file_hash(file_path: str):
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+async def process_ai_analysis(song_id: int, file_path: str, title: str):
+    db = SessionLocal()
+    try:
+        analysis_result = openai_service.analyze_audio_with_openai(file_path, title)
+        
+        song = db.query(Song).filter(Song.id == song_id).first()
+        if song:
+            song.initial_analysis = analysis_result
+            db.commit()
+            print(f"✅ 분석 완료 (Song ID: {song_id})")
+        
+    except Exception as e:
+        print(f"❌ 분석 실패: {e}")
+    finally:
+        db.close()
+        safe_delete(file_path)
+
+# --- API 엔드포인트 ---
 
 @app.post("/api/analyze")
-async def analyze(bg_tasks: BackgroundTasks, file: UploadFile = File(...), title: str = Form(...), db: Session = Depends(get_db)):
+async def analyze_song(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    db: Session = Depends(get_db)
+):
     os.makedirs("uploads", exist_ok=True)
-    path = f"uploads/{file.filename}"
-    with open(path, "wb") as b: shutil.copyfileobj(file.file, b)
+    unique_filename = f"{uuid.uuid4()}_{file.filename}"
+    file_path = f"uploads/{unique_filename}"
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    file_hash = calculate_file_hash(file_path)
+    existing_song = db.query(Song).filter(Song.file_hash == file_hash).first()
+    
+    if existing_song:
+        safe_delete(file_path)
+        return {"id": existing_song.id, "status": "cached"}
 
-    h = calculate_file_hash(path)
-    exist = db.query(Song).filter(Song.file_hash == h).first()
-    if exist:
-        os.remove(path)
-        return {"id": exist.id, "status": "cached"}
-
-    new_song = Song(title=title, file_hash=h, initial_analysis="Analyzing...")
+    new_song = Song(title=title, file_hash=file_hash, initial_analysis="Analyzing...")
     db.add(new_song)
     db.commit()
     db.refresh(new_song)
-    bg_tasks.add_task(process_ai, new_song.id, path, title)
+    
+    background_tasks.add_task(process_ai_analysis, new_song.id, file_path, title)
+    
     return {"id": new_song.id, "status": "processing"}
 
-@app.get("/api/songs/{id}")
-def get_song(id: int, db: Session = Depends(get_db)):
-    return db.query(Song).filter(Song.id == id).first()
-
-@app.post("/api/songs/{id}/comments")
-def add_comment(id: int, username: str, content: str, db: Session = Depends(get_db)):
-    db.add(Comment(song_id=id, username=username, content=content))
-    db.commit()
-    return {"status": "ok"}
-
-@app.get("/api/songs/{id}/comments")
-def get_comments(id: int, db: Session = Depends(get_db)):
-    return db.query(Comment).filter(Comment.song_id == id).all()
-
-# --- main.py 맨 아래에 추가 ---
-
 @app.get("/api/songs")
-def get_all_songs(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
-    # 최신순(내림차순)으로 20개 가져오기
-    songs = db.query(Song).order_by(Song.created_at.desc()).offset(skip).limit(limit).all()
-    return songs
+def get_all_songs(skip: int = 0, limit: int = 20, sort: str = "new", db: Session = Depends(get_db)):
+    songs = db.query(Song).all()
+    if sort == "hot":
+        # 인기순 (좋아요 + 댓글*3)
+        songs.sort(key=lambda x: x.likes + (len(x.comments) * 3), reverse=True)
+    else:
+        # 최신순
+        songs.sort(key=lambda x: x.created_at, reverse=True)
+    return songs[skip : skip + limit]
+
+@app.get("/api/songs/{song_id}")
+def get_song(song_id: int, db: Session = Depends(get_db)):
+    return db.query(Song).filter(Song.id == song_id).first()
+
+@app.post("/api/songs/{song_id}/comments")
+def add_comment(song_id: int, username: str, content: str, db: Session = Depends(get_db)):
+    comment = Comment(song_id=song_id, username=username, content=content)
+    db.add(comment)
+    db.commit()
+    return {"status": "success"}
+
+@app.get("/api/songs/{song_id}/comments")
+def get_comments(song_id: int, db: Session = Depends(get_db)):
+    return db.query(Comment).filter(Comment.song_id == song_id).all()
+
+@app.post("/api/songs/{song_id}/like")
+def like_song(song_id: int, db: Session = Depends(get_db)):
+    song = db.query(Song).filter(Song.id == song_id).first()
+    if song:
+        song.likes += 1
+        db.commit()
+        return {"status": "success", "likes": song.likes}
+    return {"status": "error"}
+
+# ✅ [최종] AI 재분석 (양식 강제 + 피드백 로그)
+@app.post("/api/songs/{song_id}/refine")
+async def refine_analysis(song_id: int, db: Session = Depends(get_db)):
+    song = db.query(Song).filter(Song.id == song_id).first()
+    comments = db.query(Comment).filter(Comment.song_id == song_id).all()
+    
+    if not song or not comments:
+        return {"status": "no_data"}
+
+    comments_text = "\n".join([f"- {c.username}: {c.content}" for c in comments])
+    
+    from openai_service import client, MODEL_NAME
+    
+    # 모델명 강제 설정 (텍스트 처리는 gpt-4o가 더 안정적일 수 있음, 여기선 기존 모델 사용)
+    # 템플릿과 피드백 로그를 강제하는 강력한 프롬프트
+    prompt = f"""
+    당신은 수석 사운드 엔지니어입니다.
+    사용자들의 [피드백]을 반영하여, 반드시 아래 **[출력 양식]**에 맞춰 분석 리포트를 **전면 재작성**하세요.
+    이전 분석 내용은 무시하고, 양식에 맞춰 새로 쓰세요.
+
+    [기존 분석 데이터]:
+    {song.initial_analysis}
+
+    [사용자 피드백]:
+    {comments_text}
+
+    [출력 양식 (엄수)]:
+    ## 📢 피드백 반영 리포트 (Feedback Log)
+    - **반영된 의견**: (어떤 의견을 반영했는지 구체적으로)
+    - **거절된 의견**: (전문가적 관점에서 기각한 의견과 이유)
+
+    ---
+
+    ## 1. 📋 곡 개요 (Overview)
+    - **장르**:
+    - **분위기**:
+    - **BPM**:
+
+    ## 2. 🎚️ 사운드 밸런스 (Frequency & Mix)
+    - **Low**:
+    - **Mid**:
+    - **High**:
+    - **Stereo Image**:
+
+    ## 3. 🎹 타임라인 상세 분석 (Timeline)
+    - **Intro**:
+    - **Build-up**:
+    - **Drop**:
+    - **Breakdown**:
+
+    ## 4. 💡 총평 (Engineer's Note)
+    - (요약)
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME, # gpt-4o-audio-preview
+            modalities=["text"],
+            messages=[
+                {"role": "system", "content": "너는 양식을 철저히 지키는 전문가다."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        refined = response.choices[0].message.content
+        
+        song.initial_analysis = refined
+        db.commit()
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Refine Error: {e}") # 백엔드 콘솔에 에러 출력
+        return {"status": "error", "message": str(e)}
