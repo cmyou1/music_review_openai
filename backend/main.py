@@ -64,3 +64,11 @@ def add_comment(id: int, username: str, content: str, db: Session = Depends(get_
 @app.get("/api/songs/{id}/comments")
 def get_comments(id: int, db: Session = Depends(get_db)):
     return db.query(Comment).filter(Comment.song_id == id).all()
+
+# --- main.py 맨 아래에 추가 ---
+
+@app.get("/api/songs")
+def get_all_songs(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
+    # 최신순(내림차순)으로 20개 가져오기
+    songs = db.query(Song).order_by(Song.created_at.desc()).offset(skip).limit(limit).all()
+    return songs
